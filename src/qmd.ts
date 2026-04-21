@@ -9,13 +9,14 @@
 
 import { exec, ChildProcess, ExecException } from "child_process";
 import { promisify } from "util";
+import * as path from "path";
 
 const defaultExecAsync = promisify(exec);
 
 // Type for the async exec function
 export type ExecAsyncFn = (
 	command: string,
-	options?: { maxBuffer?: number; cwd?: string }
+	options?: { maxBuffer?: number; cwd?: string; env?: NodeJS.ProcessEnv }
 ) => Promise<{ stdout: string; stderr: string }>;
 
 // --- Types for QMD JSON output ---
@@ -189,6 +190,40 @@ export class QMDWrapper {
 	}
 
 	/**
+	 * Extracts Node bin path from QMD binary path if installed globally via npm/yarn/bun
+	 * and injects it into PATH to fix GUI apps missing terminal PATH
+	 */
+	private getEnvWithNodePath(): NodeJS.ProcessEnv {
+		const env = { ...process.env };
+		
+		if (this.binaryPath.includes("node_modules")) {
+			// Extract everything before node_modules
+			const nodeModulesDir = this.binaryPath.substring(0, this.binaryPath.indexOf("node_modules"));
+			
+			// Resolve the bin directory relative to the node_modules parent
+			// E.g. /home/user/.nvm/versions/node/v22.0.0/lib/ -> /home/user/.nvm/versions/node/v22.0.0/bin
+			let nodeBinPath = "";
+			if (nodeModulesDir.endsWith("lib/") || nodeModulesDir.endsWith("lib\\") || nodeModulesDir.endsWith(`lib${path.sep}`)) {
+				nodeBinPath = path.join(nodeModulesDir, "../bin");
+			} else {
+				nodeBinPath = path.join(nodeModulesDir, "bin");
+			}
+			
+			// Find the correct PATH key (case-insensitive for Windows)
+			const pathKey = Object.keys(env).find(k => k.toLowerCase() === 'path') || 'PATH';
+			
+			// Prepend it to PATH using the OS-specific delimiter
+			if (env[pathKey]) {
+				env[pathKey] = `${nodeBinPath}${path.delimiter}${env[pathKey]}`;
+			} else {
+				env[pathKey] = nodeBinPath;
+			}
+		}
+		
+		return env;
+	}
+
+	/**
 	 * Execute a raw command and return output
 	 */
 	private async execCommand(command: string): Promise<{ stdout: string; stderr: string }> {
@@ -196,10 +231,20 @@ export class QMDWrapper {
 			const { stdout, stderr } = await this.execAsync(command, {
 				maxBuffer: 10 * 1024 * 1024, // 10MB buffer for large outputs
 				cwd: this.vaultPath,
+				env: this.getEnvWithNodePath(),
 			});
 			return { stdout, stderr };
 		} catch (error) {
 			const execError = error as ExecException & { stdout?: string; stderr?: string };
+			
+			// Check for node missing
+			if (execError.code === 127 && (execError.stderr?.includes("node") || execError.message?.includes("node"))) {
+				throw new QMDError(
+					"Node.js not found in PATH. Please check your QMD binary path settings.",
+					"execution_error",
+					execError.stderr
+				);
+			}
 			
 			// Check for common error conditions
 			if (execError.code === 127 || execError.message?.includes("not found")) {
@@ -253,6 +298,7 @@ export class QMDWrapper {
 				{
 					maxBuffer: 10 * 1024 * 1024,
 					cwd: this.vaultPath,
+					env: this.getEnvWithNodePath(),
 				},
 				(error, stdout, stderr) => {
 					this.currentSearchProcess = null;
@@ -265,6 +311,16 @@ export class QMDWrapper {
 						}
 						
 						const execError = error as ExecException & { stdout?: string; stderr?: string };
+						
+						// Check for node missing
+						if (execError.code === 127 && (stderr?.includes("node") || execError.message?.includes("node"))) {
+							reject(new QMDError(
+								"Node.js not found in PATH. Please check your QMD binary path settings.",
+								"execution_error",
+								stderr
+							));
+							return;
+						}
 						
 						if (execError.code === 127 || execError.message?.includes("not found")) {
 							reject(new QMDError(
